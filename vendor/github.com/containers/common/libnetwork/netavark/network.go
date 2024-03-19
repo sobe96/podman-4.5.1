@@ -1,5 +1,4 @@
 //go:build linux || freebsd
-// +build linux freebsd
 
 package netavark
 
@@ -12,9 +11,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containers/common/libnetwork/internal/rootlessnetns"
 	"github.com/containers/common/libnetwork/internal/util"
 	"github.com/containers/common/libnetwork/types"
 	"github.com/containers/common/pkg/config"
+	"github.com/containers/common/pkg/version"
 	"github.com/containers/storage/pkg/lockfile"
 	"github.com/containers/storage/pkg/unshare"
 	"github.com/sirupsen/logrus"
@@ -35,6 +36,9 @@ type netavarkNetwork struct {
 	// aardvarkBinary is the path to the aardvark binary.
 	aardvarkBinary string
 
+	// firewallDriver sets the firewall driver to use
+	firewallDriver string
+
 	// defaultNetwork is the name for the default network.
 	defaultNetwork string
 	// defaultSubnet is the default subnet for the default network.
@@ -43,7 +47,7 @@ type netavarkNetwork struct {
 	// defaultsubnetPools contains the subnets which must be used to allocate a free subnet by network create
 	defaultsubnetPools []config.SubnetPool
 
-	// dnsBindPort is set the the port to pass to netavark for aardvark
+	// dnsBindPort is set the port to pass to netavark for aardvark
 	dnsBindPort uint16
 
 	// pluginDirs list of directories were netavark plugins are located
@@ -52,7 +56,7 @@ type netavarkNetwork struct {
 	// ipamDBPath is the path to the ip allocation bolt db
 	ipamDBPath string
 
-	// syslog describes whenever the netavark debbug output should be log to the syslog as well.
+	// syslog describes whenever the netavark debug output should be log to the syslog as well.
 	// This will use logrus to do so, make sure logrus is set up to log to the syslog.
 	syslog bool
 
@@ -64,6 +68,9 @@ type netavarkNetwork struct {
 
 	// networks is a map with loaded networks, the key is the network name
 	networks map[string]*types.Network
+
+	// rootlessNetns is used for the rootless network setup/teardown
+	rootlessNetns *rootlessnetns.Netns
 }
 
 type InitConfig struct {
@@ -78,23 +85,12 @@ type InitConfig struct {
 	// NetworkRunDir is where temporary files are stored, i.e.the ipam db, aardvark config
 	NetworkRunDir string
 
-	// DefaultNetwork is the name for the default network.
-	DefaultNetwork string
-	// DefaultSubnet is the default subnet for the default network.
-	DefaultSubnet string
-
-	// DefaultsubnetPools contains the subnets which must be used to allocate a free subnet by network create
-	DefaultsubnetPools []config.SubnetPool
-
-	// DNSBindPort is set the the port to pass to netavark for aardvark
-	DNSBindPort uint16
-
-	// PluginDirs list of directories were netavark plugins are located
-	PluginDirs []string
-
-	// Syslog describes whenever the netavark debbug output should be log to the syslog as well.
+	// Syslog describes whenever the netavark debug output should be log to the syslog as well.
 	// This will use logrus to do so, make sure logrus is set up to log to the syslog.
 	Syslog bool
+
+	// Config containers.conf options
+	Config *config.Config
 }
 
 // NewNetworkInterface creates the ContainerNetwork interface for the netavark backend.
@@ -111,12 +107,12 @@ func NewNetworkInterface(conf *InitConfig) (types.ContainerNetwork, error) {
 		return nil, err
 	}
 
-	defaultNetworkName := conf.DefaultNetwork
+	defaultNetworkName := conf.Config.Network.DefaultNetwork
 	if defaultNetworkName == "" {
 		defaultNetworkName = types.DefaultNetworkName
 	}
 
-	defaultSubnet := conf.DefaultSubnet
+	defaultSubnet := conf.Config.Network.DefaultSubnet
 	if defaultSubnet == "" {
 		defaultSubnet = types.DefaultSubnet
 	}
@@ -133,9 +129,17 @@ func NewNetworkInterface(conf *InitConfig) (types.ContainerNetwork, error) {
 		return nil, err
 	}
 
-	defaultSubnetPools := conf.DefaultsubnetPools
+	defaultSubnetPools := conf.Config.Network.DefaultSubnetPools
 	if defaultSubnetPools == nil {
 		defaultSubnetPools = config.DefaultSubnetPools
+	}
+
+	var netns *rootlessnetns.Netns
+	if unshare.IsRootless() {
+		netns, err = rootlessnetns.New(conf.NetworkRunDir, rootlessnetns.Netavark, conf.Config)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	n := &netavarkNetwork{
@@ -145,13 +149,15 @@ func NewNetworkInterface(conf *InitConfig) (types.ContainerNetwork, error) {
 		aardvarkBinary:     conf.AardvarkBinary,
 		networkRootless:    unshare.IsRootless(),
 		ipamDBPath:         filepath.Join(conf.NetworkRunDir, "ipam.db"),
+		firewallDriver:     conf.Config.Network.FirewallDriver,
 		defaultNetwork:     defaultNetworkName,
 		defaultSubnet:      defaultNet,
 		defaultsubnetPools: defaultSubnetPools,
-		dnsBindPort:        conf.DNSBindPort,
-		pluginDirs:         conf.PluginDirs,
+		dnsBindPort:        conf.Config.Network.DNSBindPort,
+		pluginDirs:         conf.Config.Network.NetavarkPluginDirs.Get(),
 		lock:               lock,
 		syslog:             conf.Syslog,
+		rootlessNetns:      netns,
 	}
 
 	return n, nil
@@ -334,6 +340,37 @@ func (n *netavarkNetwork) Len() int {
 // DefaultInterfaceName return the default cni bridge name, must be suffixed with a number.
 func (n *netavarkNetwork) DefaultInterfaceName() string {
 	return defaultBridgeName
+}
+
+// NetworkInfo return the network information about binary path,
+// package version and program version.
+func (n *netavarkNetwork) NetworkInfo() types.NetworkInfo {
+	path := n.netavarkBinary
+	packageVersion := version.Package(path)
+	programVersion, err := version.Program(path)
+	if err != nil {
+		logrus.Infof("Failed to get the netavark version: %v", err)
+	}
+	info := types.NetworkInfo{
+		Backend: types.Netavark,
+		Version: programVersion,
+		Package: packageVersion,
+		Path:    path,
+	}
+
+	dnsPath := n.aardvarkBinary
+	dnsPackage := version.Package(dnsPath)
+	dnsProgram, err := version.Program(dnsPath)
+	if err != nil {
+		logrus.Infof("Failed to get the aardvark version: %v", err)
+	}
+	info.DNS = types.DNSNetworkInfo{
+		Package: dnsPackage,
+		Path:    dnsPath,
+		Version: dnsProgram,
+	}
+
+	return info
 }
 
 func (n *netavarkNetwork) Network(nameOrID string) (*types.Network, error) {
